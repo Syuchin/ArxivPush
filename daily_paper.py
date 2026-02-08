@@ -46,7 +46,7 @@ FINAL_PUSH_COUNT = 20
 DEFAULT_PROMPT_FILE = "prompts/deepseek_summary_prompt.zh.j2"
 
 # 模型配置
-DEFAULT_MODEL = "glm-4.7-flash"
+DEFAULT_MODEL = "glm-4.7"
 DEFAULT_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
 # 默认 max_tokens（GLM-4.7 需要更多 tokens 用于推理）
