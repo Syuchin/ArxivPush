@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -99,6 +100,18 @@ def get_code_link(arxiv_url: str, session: requests.Session, timeout_s: int = 10
     return None
 
 
+def _extract_score(analysis: str) -> float:
+    """从分析文本中提取相关性评分（1-5分），默认返回 3.0"""
+    match = re.search(r'评分[：:]\s*(\d+(?:\.\d+)?)\s*/\s*5', analysis)
+    if match:
+        try:
+            score = float(match.group(1))
+            return max(1.0, min(5.0, score))  # 限制在 1-5 范围内
+        except ValueError:
+            pass
+    return 3.0  # 默认中等评分
+
+
 def summarize_with_deepseek(
     paper: dict[str, str],
     *,
@@ -118,7 +131,7 @@ def summarize_with_deepseek(
         "messages": [
             {
                 "role": "system",
-                "content": "你擅长把 AI 论文总结成结构化要点，保持严谨，不胡编。",
+                "content": "你是一个严格的学术论文筛选助手，专注于 LLM Safety、Agent Safety 和 AI Agent 领域。请客观评估论文的相关性和创新性。",
             },
             {"role": "user", "content": prompt_text},
         ],
@@ -152,25 +165,122 @@ def summarize_with_deepseek(
     return content.strip()
 
 
-def _feishu_card_payload(title: str, markdown: str, footer_note: str) -> dict[str, Any]:
+def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> dict[str, Any]:
+    """生成飞书富文本卡片 payload（支持多篇论文）"""
+    elements = []
+
+    for i, paper in enumerate(papers):
+        # 提取评分
+        analysis = paper['analysis']
+        score_match = re.search(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5', analysis)
+        score_text = f"<font color='red'>({score_match.group(1)}/5)</font>" if score_match else ""
+
+        # 标题（带评分）
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**{i+1}/{len(papers)}. <font color='blue'>{paper['title']}</font>** {score_text}"
+            }
+        })
+
+        # 链接按钮
+        actions = [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "查看论文"},
+            "type": "primary",
+            "url": paper['url']
+        }]
+        if paper.get('code_url'):
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "查看代码"},
+                "type": "default",
+                "url": paper['code_url']
+            })
+        elements.append({"tag": "action", "actions": actions})
+
+        # 合并：问题定义 + 方法核心 + 主要发现
+        core_content = []
+
+        problem_match = re.search(r'【问题定义】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
+        if problem_match:
+            core_content.append(f"<font color='violet'>**【问题定义】**</font>\n{problem_match.group(1).strip()}")
+
+        method_match = re.search(r'【方法核心】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
+        if method_match:
+            core_content.append(f"<font color='blue'>**【方法核心】**</font>\n{method_match.group(1).strip()}")
+
+        finding_match = re.search(r'【主要发现】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
+        if finding_match:
+            core_content.append(f"<font color='violet'>**【主要发现】**</font>\n{finding_match.group(1).strip()}")
+
+        if core_content:
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "\n\n".join(core_content)
+                }
+            })
+
+        # 合并：局限性推测 + 潜在关联
+        analysis_content = []
+
+        limitation_match = re.search(r'【局限性推测】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
+        if limitation_match:
+            analysis_content.append(f"<font color='orange'>**【局限性推测】**</font>\n{limitation_match.group(1).strip()}")
+
+        relation_match = re.search(r'【潜在关联】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
+        if relation_match:
+            analysis_content.append(f"<font color='green'>**【潜在关联】**</font>\n{relation_match.group(1).strip()}")
+
+        if analysis_content:
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "\n\n".join(analysis_content)
+                }
+            })
+
+        # 提取一句话结论
+        conclusion_match = re.search(r'【一句话结论】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
+        if conclusion_match:
+            conclusion_text = conclusion_match.group(1).strip()
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"<font color='blue'>**【一句话结论】**</font>\n{conclusion_text}"
+                }
+            })
+
+        # 如果不是最后一篇，添加分隔线
+        if i < len(papers) - 1:
+            elements.append({"tag": "hr"})
+
+    # 添加页脚
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "note",
+        "elements": [{"tag": "plain_text", "content": footer_note}]
+    })
+
     return {
         "msg_type": "interactive",
         "card": {
             "header": {
                 "title": {"tag": "plain_text", "content": title},
-                "template": "orange",
+                "template": "blue"
             },
-            "elements": [
-                {"tag": "markdown", "content": markdown},
-                {"tag": "hr"},
-                {"tag": "note", "elements": [{"tag": "plain_text", "content": footer_note}]},
-            ],
-        },
+            "elements": elements
+        }
     }
 
 
 def push_to_feishu(
-    markdown: str,
+    papers: list[dict],
     *,
     webhook: str,
     session: requests.Session,
@@ -178,9 +288,18 @@ def push_to_feishu(
     footer_note: str,
     timeout_s: int = 15,
 ) -> None:
-    """发送飞书富文本卡片（失败会抛异常）。"""
+    """发送飞书富文本卡片（失败会抛异常）。
+
+    Args:
+        papers: 论文列表，每个元素包含 title, url, code_url, analysis
+        webhook: 飞书 Webhook 地址
+        session: requests.Session 对象
+        title: 卡片标题
+        footer_note: 页脚文本
+        timeout_s: 超时时间（秒）
+    """
     headers = {"Content-Type": "application/json"}
-    payload = _feishu_card_payload(title=title, markdown=markdown, footer_note=footer_note)
+    payload = _feishu_card_payload(title=title, papers=papers, footer_note=footer_note)
     resp = session.post(webhook, headers=headers, json=payload, timeout=timeout_s)
     resp.raise_for_status()
     data = resp.json()
@@ -219,12 +338,6 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--dry-run", action="store_true", default=_strtobool(os.getenv("DRY_RUN")))
     return parser.parse_args()
-
-
-def _format_paper_block(idx: int, total: int, *, title: str, url: str, code_url: Optional[str], analysis: str) -> str:
-    code_md = f" | [💻 代码]({code_url})" if code_url else ""
-    header = f"### {idx}/{total}. {title}\n🔗 [原文]({url}){code_md}\n"
-    return header + analysis.strip() + "\n"
 
 
 def main() -> int:
@@ -275,7 +388,8 @@ def main() -> int:
             )
         return 0
 
-    blocks: list[str] = []
+    # 第一步：分析所有论文并提取评分
+    paper_data: list[dict] = []
     total = len(results)
     for i, res in enumerate(results, start=1):
         print(f"正在分析第 {i}/{total} 篇: {res.title}")
@@ -288,6 +402,7 @@ def main() -> int:
 
         if args.skip_llm:
             analysis = f"【摘要（未调用 LLM）】\n{paper_info['summary']}\n"
+            score = 3.0
         else:
             try:
                 analysis = summarize_with_deepseek(
@@ -299,49 +414,77 @@ def main() -> int:
                     max_tokens=args.deepseek_max_tokens,
                     session=session,
                 )
+                score = _extract_score(analysis)
             except Exception as e:
                 analysis = f"【LLM 解析失败】{str(e)}\n\n【摘要】{paper_info['summary']}"
+                score = 3.0
 
-        blocks.append(
-            _format_paper_block(
-                i,
-                total,
-                title=paper_info["title"],
-                url=paper_info["url"],
-                code_url=code_url,
-                analysis=analysis,
-            )
-        )
+        paper_data.append({
+            "title": paper_info["title"],
+            "url": paper_info["url"],
+            "code_url": code_url,
+            "analysis": analysis,
+            "score": score,
+        })
 
+    # 第二步：按评分从高到低排序
+    paper_data.sort(key=lambda x: x["score"], reverse=True)
+
+    # 第三步：过滤低分论文（可选，评分 < 3 的不推送）
+    min_score = 3.0
+    filtered_papers = [p for p in paper_data if p["score"] >= min_score]
+
+    if not filtered_papers:
+        msg = f"今日无高相关性论文（所有论文评分 < {min_score}）。"
+        print(msg)
+        _write_github_step_summary(f"## ArXiv 每日推送\n\n{msg}\n")
+        # 不推送空消息到飞书
+        return 0
+
+    # 第四步：生成推送内容
     date_label = datetime.now().strftime("%m-%d")
-    footer = "基于 DeepSeek 自动生成（仅供学习参考）"
+    card_title = f"🚀 ArXiv {date_label}"
+    footer_note = f"自动生成 | 共 {len(filtered_papers)} 篇高相关性论文"
+
+    # 生成 GitHub Step Summary
+    summary_blocks = []
+    for i, paper in enumerate(filtered_papers, start=1):
+        code_md = f" | [💻 代码]({paper['code_url']})" if paper.get('code_url') else ""
+        header = f"### {i}/{len(filtered_papers)}. {paper['title']}\n🔗 [原文]({paper['url']}){code_md}\n"
+        summary_blocks.append(header + paper['analysis'].strip() + "\n")
+
+    summary_md = f"## ArXiv 每日推送 ({date_label})\n\n" + "\n---\n\n".join(summary_blocks)
+    _write_github_step_summary(summary_md)
 
     if args.dry_run:
-        combined = "\n\n---\n\n".join(blocks).strip() + "\n"
-        print(combined)
-        _write_github_step_summary(f"## ArXiv {date_label}\n\n" + combined)
+        print(summary_md)
+        return 0
+
+    # 推送到飞书
+    if not args.feishu_webhook:
+        print("未配置飞书 Webhook，跳过推送")
         return 0
 
     if args.per_paper:
-        for block in blocks:
+        # 每篇论文单独推送
+        for i, paper in enumerate(filtered_papers, start=1):
             push_to_feishu(
-                block,
+                [paper],
                 webhook=args.feishu_webhook,
                 session=session,
-                title=f"🚀 ArXiv {date_label}",
-                footer_note=footer,
+                title=f"🚀 ArXiv {date_label} ({i}/{len(filtered_papers)})",
+                footer_note=footer_note,
             )
     else:
-        combined = "\n\n---\n\n".join(blocks).strip()
+        # 合并推送
         push_to_feishu(
-            combined,
+            filtered_papers,
             webhook=args.feishu_webhook,
             session=session,
-            title=f"🚀 ArXiv {date_label}",
-            footer_note=footer,
+            title=card_title,
+            footer_note=footer_note,
         )
 
-    _write_github_step_summary(f"## ArXiv {date_label}\n\n" + "\n\n---\n\n".join(blocks).strip() + "\n")
     print("推送成功！")
     return 0
 
