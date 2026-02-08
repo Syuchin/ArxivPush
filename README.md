@@ -5,14 +5,16 @@
 ## ✨ 功能特性
 
 - 🔍 **自动抓取**：每日自动获取 ArXiv 最新 LLM Safety / Agent Safety / AI Agent 相关论文
-- 🤖 **AI 深度分析**：调用 LLM API（支持智谱 GLM、DeepSeek 等）生成结构化中文解读：
-  - 【相关性评分】：1-5 分评估论文与研究领域的相关性
-  - 【动机】：研究背景和要解决的问题
-  - 【方法】：核心技术方案
-  - 【发现】：主要结果和贡献
-  - 【创新点评价】：idea 的新颖性和实用价值
+- 🤖 **AI 深度分析**：调用智谱 GLM-4.7 API 生成结构化中文解读：
+  - 【相关性】：1-5 分评估论文与研究领域的相关性
+  - 【问题定义】：研究背景和核心瓶颈
+  - 【方法核心】：关键技术思路和"为什么能 work"的直觉
+  - 【主要发现】：实验结论和量级对比
+  - 【局限性推测】：推测可能的局限性
+  - 【潜在关联】：从 mechanistic interpretability、tokenization fragmentation、agent robustness 三个角度判断是否可为研究提供借鉴
+  - 【一句话结论】：口语化总结，帮助快速判断是否值得精读
 - 📊 **智能排序**：按相关性评分自动排序，优先推送高分论文
-- 🎯 **智能过滤**：自动过滤低相关性论文（评分 < 3 分）
+- 🎯 **智能过滤**：自动过滤低相关性论文（评分 < 3 分），只推送前 20 篇最相关的论文
 - 💻 **代码链接**：自动从 PapersWithCode 匹配开源代码
 - 📱 **飞书推送**：生成精美富文本卡片推送至飞书群
 
@@ -24,26 +26,25 @@
 pip install -r requirements.txt
 ```
 
-### 2. 配置（推荐用环境变量）
+### 2. 配置
 
-通过环境变量提供飞书 Webhook 与 API Key（避免把密钥写进代码/仓库）：
+**只需配置 2 个敏感信息**（其他配置已写死在代码中）：
 
 ```bash
 export FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/你的Webhook地址"
-export DEEPSEEK_API_KEY="你的API Key"
-# 智谱 GLM API（推荐）
-export DEEPSEEK_API_URL="https://open.bigmodel.cn/api/paas/v4/chat/completions"
-# 或使用 DeepSeek API
-# export DEEPSEEK_API_URL="https://api.deepseek.com/v1/chat/completions"
+export DEEPSEEK_API_KEY="你的智谱API Key"
 ```
 
-你也可以把上述变量写到项目根目录的 `.env`（参考 `.env.example`），脚本会自动加载。
-
-默认 Prompt 模板在 `prompts/deepseek_summary_prompt.zh.j2`（Jinja2），可用 `{{ title }}`、`{{ summary }}`（以及 `url`）等变量自由修改。
+你也可以把上述变量写到项目根目录的 `.env` 文件，脚本会自动加载。
 
 - 飞书 Webhook：在飞书群设置 → 添加机器人 → 自定义机器人 → 获取 Webhook 地址
 - 智谱 GLM API Key：在 [智谱开放平台](https://open.bigmodel.cn/) 获取
-- DeepSeek API Key：在 [DeepSeek 开放平台](https://platform.deepseek.com/) 获取
+
+**默认配置**（已写死在代码中，无需修改）：
+- 模型：`glm-4-7`（使用 Coding API 端点）
+- 查询关键词：`LLM safety`, `agent safety`, `AI agent`, `language model safety`, `autonomous agent`
+- 获取数量：50 篇（筛选后推送前 20 篇高分论文）
+- 评分阈值：3.0 分（低于此分数的论文不推送）
 
 ### 3. 本地运行
 
@@ -77,15 +78,11 @@ python3 daily_paper.py
 
    进入仓库页面 → Settings → Secrets and variables → Actions → New repository secret
 
-   添加以下 Secrets：
+   **只需添加 2 个 Secrets**：
    - `FEISHU_WEBHOOK`：你的飞书 Webhook 地址
-   - `DEEPSEEK_API_KEY`：你的 API Key（智谱 GLM 或 DeepSeek）
-   - `DEEPSEEK_API_URL`：API 地址
-     - 智谱 GLM：`https://open.bigmodel.cn/api/paas/v4/chat/completions`
-     - DeepSeek：`https://api.deepseek.com/v1/chat/completions`
-   - `DEEPSEEK_MODEL`：模型名称（如 `glm-4-flash` 或 `deepseek-chat`）
-   - `ARXIV_QUERY`：查询关键词（如 `abs:"LLM safety" OR abs:"agent safety" OR abs:"AI agent"`）
-   - `MAX_RESULTS`：每次获取论文数量（如 `10`）
+   - `DEEPSEEK_API_KEY`：你的智谱 GLM API Key
+
+   其他配置（模型、查询关键词、推送数量等）已写死在代码中，无需配置。
 
 3. **启用 GitHub Actions**
 

@@ -24,9 +24,33 @@ except ImportError:  # pragma: no cover
     StrictUndefined = None
 
 PWC_BASE_URL = "https://arxiv.paperswithcode.com/api/v0/papers/"
-DEFAULT_DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-DEFAULT_ARXIV_QUERY = 'abs:LLM OR abs:"AI Agent" OR abs:"Deep Learning"'
+
+# ============ 配置常量（不隐私的配置直接写死） ============
+
+# ArXiv 查询关键词
+DEFAULT_ARXIV_QUERY = 'abs:"LLM safety" OR abs:"agent safety" OR abs:"AI agent" OR abs:"language model safety" OR abs:"autonomous agent"'
+
+# 每次获取论文数量（会获取更多论文，然后按评分筛选）
+DEFAULT_MAX_RESULTS = 50  # 获取 50 篇，筛选出评分 >= 3 的前 20 篇
+
+# 时间范围（小时）：0 表示不限制
+DEFAULT_SINCE_HOURS = 0.0
+
+# 最低评分阈值（低于此分数的论文不推送）
+MIN_SCORE_THRESHOLD = 3.0
+
+# 最终推送论文数量
+FINAL_PUSH_COUNT = 20
+
+# Prompt 模板文件
 DEFAULT_PROMPT_FILE = "prompts/deepseek_summary_prompt.zh.j2"
+
+# 模型配置
+DEFAULT_MODEL = "glm-4.7-flash"
+DEFAULT_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+# 默认 max_tokens（GLM-4.7 需要更多 tokens 用于推理）
+DEFAULT_MAX_TOKENS = 2000
 
 
 def _strtobool(v: Optional[str]) -> bool:
@@ -159,7 +183,18 @@ def summarize_with_deepseek(
         raise RuntimeError(f"API 未预期响应: {json.dumps(res_json, ensure_ascii=False)}")
 
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = message.get("content") if isinstance(message, dict) else None
+
+    # GLM-4.7 等推理模型可能将内容放在 reasoning_content 中
+    content = None
+    if isinstance(message, dict):
+        content = message.get("content")
+        # 如果 content 为空，尝试从 reasoning_content 中提取
+        if not content or not content.strip():
+            reasoning_content = message.get("reasoning_content")
+            if reasoning_content:
+                print("警告：模型返回的 content 为空，使用 reasoning_content")
+                content = reasoning_content
+
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError(f"API 未返回 content: {json.dumps(res_json, ensure_ascii=False)}")
     return content.strip()
@@ -220,7 +255,7 @@ def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> di
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": "\n\n".join(core_content)
+                    "content": "\n".join(core_content)
                 }
             })
 
@@ -240,7 +275,7 @@ def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> di
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": "\n\n".join(analysis_content)
+                    "content": "\n".join(analysis_content)
                 }
             })
 
@@ -323,16 +358,16 @@ def _write_github_step_summary(markdown: str) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch latest arXiv papers, summarize, and push to Feishu.")
     parser.add_argument("--query", default=_getenv_str("ARXIV_QUERY", DEFAULT_ARXIV_QUERY))
-    parser.add_argument("--max-results", type=int, default=_getenv_int("MAX_RESULTS", 3))
-    parser.add_argument("--since-hours", type=float, default=_getenv_float("SINCE_HOURS", 0.0))
+    parser.add_argument("--max-results", type=int, default=_getenv_int("MAX_RESULTS", DEFAULT_MAX_RESULTS))
+    parser.add_argument("--since-hours", type=float, default=_getenv_float("SINCE_HOURS", DEFAULT_SINCE_HOURS))
 
     parser.add_argument("--feishu-webhook", default=_getenv_str("FEISHU_WEBHOOK"))
     parser.add_argument("--per-paper", action="store_true", default=_strtobool(os.getenv("FEISHU_PER_PAPER")))
 
     parser.add_argument("--deepseek-api-key", default=_getenv_str("DEEPSEEK_API_KEY"))
-    parser.add_argument("--deepseek-api-url", default=_getenv_str("DEEPSEEK_API_URL", DEFAULT_DEEPSEEK_API_URL))
-    parser.add_argument("--deepseek-model", default=_getenv_str("DEEPSEEK_MODEL", "deepseek-chat"))
-    parser.add_argument("--deepseek-max-tokens", type=int, default=_getenv_int("DEEPSEEK_MAX_TOKENS", 900))
+    parser.add_argument("--deepseek-model", default=_getenv_str("DEEPSEEK_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--deepseek-api-url", default=_getenv_str("DEEPSEEK_API_URL"))  # 如果未指定，将根据模型自动选择
+    parser.add_argument("--deepseek-max-tokens", type=int, default=_getenv_int("DEEPSEEK_MAX_TOKENS", DEFAULT_MAX_TOKENS))
     parser.add_argument("--skip-llm", action="store_true", default=_strtobool(os.getenv("SKIP_LLM")))
     parser.add_argument("--prompt-file", default=_getenv_str("PROMPT_FILE", DEFAULT_PROMPT_FILE))
 
@@ -343,6 +378,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     session = requests.Session()
+
+    # 如果未指定 API URL，使用默认值
+    if not args.deepseek_api_url:
+        args.deepseek_api_url = DEFAULT_API_URL
+        print(f"使用默认 API 端点：{args.deepseek_api_url}（模型：{args.deepseek_model}）")
 
     if not args.dry_run and not args.feishu_webhook:
         print("缺少 FEISHU_WEBHOOK：请在环境变量或参数中设置 --feishu-webhook。", file=sys.stderr)
@@ -414,8 +454,13 @@ def main() -> int:
                     max_tokens=args.deepseek_max_tokens,
                     session=session,
                 )
+                # 打印 LLM 返回的原始内容（用于调试）
+                print("\n=== LLM 返回内容 ===")
+                print(analysis)
+                print("===================\n")
                 score = _extract_score(analysis)
             except Exception as e:
+                print(f"LLM 调用失败: {str(e)}")
                 analysis = f"【LLM 解析失败】{str(e)}\n\n【摘要】{paper_info['summary']}"
                 score = 3.0
 
@@ -430,27 +475,30 @@ def main() -> int:
     # 第二步：按评分从高到低排序
     paper_data.sort(key=lambda x: x["score"], reverse=True)
 
-    # 第三步：过滤低分论文（可选，评分 < 3 的不推送）
-    min_score = 3.0
-    filtered_papers = [p for p in paper_data if p["score"] >= min_score]
+    # 第三步：过滤低分论文（评分 < MIN_SCORE_THRESHOLD 的不推送）
+    filtered_papers = [p for p in paper_data if p["score"] >= MIN_SCORE_THRESHOLD]
 
     if not filtered_papers:
-        msg = f"今日无高相关性论文（所有论文评分 < {min_score}）。"
+        msg = f"今日无高相关性论文（所有论文评分 < {MIN_SCORE_THRESHOLD}）。"
         print(msg)
         _write_github_step_summary(f"## ArXiv 每日推送\n\n{msg}\n")
         # 不推送空消息到飞书
         return 0
 
-    # 第四步：生成推送内容
+    # 第四步：只保留前 FINAL_PUSH_COUNT 篇论文
+    final_papers = filtered_papers[:FINAL_PUSH_COUNT]
+    print(f"筛选后共 {len(filtered_papers)} 篇高分论文，推送前 {len(final_papers)} 篇")
+
+    # 第五步：生成推送内容
     date_label = datetime.now().strftime("%m-%d")
     card_title = f"🚀 ArXiv {date_label}"
-    footer_note = f"自动生成 | 共 {len(filtered_papers)} 篇高相关性论文"
+    footer_note = f"自动生成 | 共 {len(final_papers)} 篇高相关性论文"
 
     # 生成 GitHub Step Summary
     summary_blocks = []
-    for i, paper in enumerate(filtered_papers, start=1):
+    for i, paper in enumerate(final_papers, start=1):
         code_md = f" | [💻 代码]({paper['code_url']})" if paper.get('code_url') else ""
-        header = f"### {i}/{len(filtered_papers)}. {paper['title']}\n🔗 [原文]({paper['url']}){code_md}\n"
+        header = f"### {i}/{len(final_papers)}. {paper['title']}\n🔗 [原文]({paper['url']}){code_md}\n"
         summary_blocks.append(header + paper['analysis'].strip() + "\n")
 
     summary_md = f"## ArXiv 每日推送 ({date_label})\n\n" + "\n---\n\n".join(summary_blocks)
@@ -467,18 +515,18 @@ def main() -> int:
 
     if args.per_paper:
         # 每篇论文单独推送
-        for i, paper in enumerate(filtered_papers, start=1):
+        for i, paper in enumerate(final_papers, start=1):
             push_to_feishu(
                 [paper],
                 webhook=args.feishu_webhook,
                 session=session,
-                title=f"🚀 ArXiv {date_label} ({i}/{len(filtered_papers)})",
+                title=f"🚀 ArXiv {date_label} ({i}/{len(final_papers)})",
                 footer_note=footer_note,
             )
     else:
         # 合并推送
         push_to_feishu(
-            filtered_papers,
+            final_papers,
             webhook=args.feishu_webhook,
             session=session,
             title=card_title,

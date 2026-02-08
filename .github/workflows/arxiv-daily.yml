@@ -35,15 +35,4 @@ jobs:
           # Required (Repository → Settings → Secrets and variables → Actions → Secrets)
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-
-          # Optional overrides (Repository → Settings → Secrets and variables → Actions → Variables)
-          TZ: ${{ vars.TZ }}
-          DEEPSEEK_API_URL: ${{ vars.DEEPSEEK_API_URL }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
-          DEEPSEEK_MAX_TOKENS: ${{ vars.DEEPSEEK_MAX_TOKENS }}
-          PROMPT_FILE: ${{ vars.PROMPT_FILE }}
-          ARXIV_QUERY: ${{ vars.ARXIV_QUERY }}
-          MAX_RESULTS: ${{ vars.MAX_RESULTS }}
-          SINCE_HOURS: ${{ vars.SINCE_HOURS }}
-          FEISHU_PER_PAPER: ${{ vars.FEISHU_PER_PAPER }}
         run: python daily_paper.py
