@@ -1,0 +1,49 @@
+name: ArXiv Daily Paper Push
+
+on:
+  schedule:
+    # GitHub Actions cron uses UTC
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: arxiv-daily-paper-push
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch, summarize and push
+        env:
+          PYTHONUTF8: "1"
+          # Required (Repository → Settings → Secrets and variables → Actions → Secrets)
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+
+          # Optional overrides (Repository → Settings → Secrets and variables → Actions → Variables)
+          TZ: ${{ vars.TZ }}
+          DEEPSEEK_API_URL: ${{ vars.DEEPSEEK_API_URL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          DEEPSEEK_MAX_TOKENS: ${{ vars.DEEPSEEK_MAX_TOKENS }}
+          PROMPT_FILE: ${{ vars.PROMPT_FILE }}
+          ARXIV_QUERY: ${{ vars.ARXIV_QUERY }}
+          MAX_RESULTS: ${{ vars.MAX_RESULTS }}
+          SINCE_HOURS: ${{ vars.SINCE_HOURS }}
+          FEISHU_PER_PAPER: ${{ vars.FEISHU_PER_PAPER }}
+        run: python daily_paper.py
