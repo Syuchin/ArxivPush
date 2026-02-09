@@ -35,7 +35,7 @@ PUSHED_IDS_FILE = "pushed_ids.txt"  # 存储已推送论文 ID 的文件
 DEFAULT_ARXIV_QUERY = 'LLM safety OR agent safety OR AI agent OR language model safety OR autonomous agent'
 
 # 每次获取论文数量（会获取更多论文，然后按评分筛选）
-DEFAULT_MAX_RESULTS = 50  # 获取 50 篇，筛选出评分 >= 3 的前 20 篇
+DEFAULT_MAX_RESULTS = 50  # 获取 50 篇，筛选出高分论文
 
 # 时间范围（小时）：获取最近 N 小时内添加到 OpenAlex 的论文
 # 设置为 48 小时（2 天）以覆盖 OpenAlex 的同步延迟
@@ -44,8 +44,9 @@ DEFAULT_SINCE_HOURS = 48.0
 # 最低评分阈值（低于此分数的论文不推送）
 MIN_SCORE_THRESHOLD = 3.0
 
-# 最终推送论文数量
-FINAL_PUSH_COUNT = 20
+# 5 分论文全部推送，其他高分论文限制数量
+PERFECT_SCORE = 5.0  # 满分论文
+MAX_NON_PERFECT_PAPERS = 20  # 非满分论文最多推送数量
 
 # Prompt 模板文件
 DEFAULT_PROMPT_FILE = "prompts/deepseek_summary_prompt.zh.j2"
@@ -837,9 +838,18 @@ def main() -> int:
         # 不推送空消息到飞书
         return 0
 
-    # 第四步：只保留前 FINAL_PUSH_COUNT 篇论文
-    final_papers = filtered_papers[:FINAL_PUSH_COUNT]
-    print(f"筛选后共 {len(filtered_papers)} 篇高分论文，推送前 {len(final_papers)} 篇")
+    # 第四步：分离满分论文和其他高分论文
+    # 满分论文（5 分）全部推送，其他高分论文最多推送 MAX_NON_PERFECT_PAPERS 篇
+    perfect_papers = [p for p in filtered_papers if p["score"] >= PERFECT_SCORE]
+    other_papers = [p for p in filtered_papers if p["score"] < PERFECT_SCORE]
+
+    # 组合：所有满分论文 + 最多 MAX_NON_PERFECT_PAPERS 篇其他高分论文
+    final_papers = perfect_papers + other_papers[:MAX_NON_PERFECT_PAPERS]
+
+    print(f"筛选后共 {len(filtered_papers)} 篇高分论文：")
+    print(f"  - 满分论文（5 分）：{len(perfect_papers)} 篇（全部推送）")
+    print(f"  - 其他高分论文（3-4.9 分）：{len(other_papers)} 篇（推送前 {min(len(other_papers), MAX_NON_PERFECT_PAPERS)} 篇）")
+    print(f"  - 最终推送：{len(final_papers)} 篇")
 
     # 第五步：生成推送内容
     date_label = datetime.now().strftime("%m-%d")
