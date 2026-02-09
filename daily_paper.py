@@ -130,7 +130,8 @@ def get_code_link(arxiv_url: str, session: requests.Session, timeout_s: int = 10
 
 def _extract_score(analysis: str) -> float:
     """从分析文本中提取相关性评分（1-5分），默认返回 3.0"""
-    match = re.search(r'评分[：:]\s*(\d+(?:\.\d+)?)\s*/\s*5', analysis)
+    # 匹配【相关性】X/5 格式
+    match = re.search(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5', analysis)
     if match:
         try:
             score = float(match.group(1))
