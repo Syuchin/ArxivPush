@@ -32,14 +32,16 @@ PUSHED_IDS_FILE = "pushed_ids.txt"  # 存储已推送论文 ID 的文件
 # ============ 配置常量（不隐私的配置直接写死） ============
 
 # ArXiv 查询关键词（用于 OpenAlex API）
-DEFAULT_ARXIV_QUERY = 'LLM safety OR agent safety OR AI agent OR language model safety OR autonomous agent'
+# 扩大范围：包含 LLM、Agent 和安全相关的论文
+DEFAULT_ARXIV_QUERY = 'LLM OR agent OR language model OR safety OR security OR robustness'
 
 # 每次获取论文数量（会获取更多论文，然后按评分筛选）
 DEFAULT_MAX_RESULTS = 50  # 获取 50 篇，筛选出高分论文
 
-# 时间范围（小时）：获取最近 N 小时内添加到 OpenAlex 的论文
-# 设置为 48 小时（2 天）以覆盖 OpenAlex 的同步延迟
-DEFAULT_SINCE_HOURS = 48.0
+# 时间范围（小时）：获取最近 N 小时内发布的论文
+# 设置为 96 小时（4 天）以覆盖周末（ArXiv 周末不更新）
+# 通过去重机制，每天只推送新论文，实现真正的"每日更新"
+DEFAULT_SINCE_HOURS = 96.0
 
 # 最低评分阈值（低于此分数的论文不推送）
 MIN_SCORE_THRESHOLD = 3.0
