@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from threading import Semaphore
 from typing import Any, Optional
 
-import arxiv
 import requests
 
 try:
@@ -27,11 +26,12 @@ except ImportError:  # pragma: no cover
     StrictUndefined = None
 
 PWC_BASE_URL = "https://arxiv.paperswithcode.com/api/v0/papers/"
+OPENALEX_BASE_URL = "https://api.openalex.org/works"
 
 # ============ 配置常量（不隐私的配置直接写死） ============
 
-# ArXiv 查询关键词
-DEFAULT_ARXIV_QUERY = 'abs:"LLM safety" OR abs:"agent safety" OR abs:"AI agent" OR abs:"language model safety" OR abs:"autonomous agent"'
+# ArXiv 查询关键词（用于 OpenAlex API）
+DEFAULT_ARXIV_QUERY = 'LLM safety OR agent safety OR AI agent OR language model safety OR autonomous agent'
 
 # 每次获取论文数量（会获取更多论文，然后按评分筛选）
 DEFAULT_MAX_RESULTS = 50  # 获取 50 篇，筛选出评分 >= 3 的前 20 篇
@@ -65,10 +65,9 @@ RETRY_DELAY = 2  # 秒
 # 请求间隔（秒）- 避免瞬间发送过多请求
 REQUEST_INTERVAL = 0.5
 
-# ArXiv API 配置（GitHub Actions 环境需要更保守的参数）
-ARXIV_PAGE_SIZE = 10  # 每次请求的结果数量（减少以避免触发速率限制）
-ARXIV_DELAY_SECONDS = 10.0  # 请求之间的延迟（秒）- 增加到 10 秒
-ARXIV_NUM_RETRIES = 10  # 重试次数 - 增加重试次数
+# OpenAlex API 配置
+OPENALEX_PER_PAGE = 50  # 每次请求的结果数量
+OPENALEX_TIMEOUT = 30  # 请求超时时间（秒）
 
 # 预编译正则：匹配【相关性】X/5 格式的评分
 _SCORE_RE = re.compile(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5')
@@ -458,6 +457,157 @@ def push_to_feishu(
             raise RuntimeError(f"飞书返回错误: {json.dumps(data, ensure_ascii=False)}")
 
 
+
+
+def fetch_papers_from_openalex(
+    query: str,
+    max_results: int,
+    since_hours: float,
+    email: str,
+    session: requests.Session,
+) -> list[dict]:
+    """
+    从 OpenAlex API 获取 ArXiv 论文
+
+    Args:
+        query: 搜索关键词
+        max_results: 最大结果数
+        since_hours: 只获取最近 N 小时内的论文（0 表示不限制）
+        email: 用于 Polite Pool 的邮箱地址
+        session: requests.Session 对象
+
+    Returns:
+        论文列表，每个论文是一个字典，包含 title, summary, entry_id, published 等字段
+    """
+    print(f"正在从 OpenAlex API 查询论文（关键词：{query}）...")
+
+    # 构建查询参数
+    params = {
+        'filter': f'indexed_in:arxiv,title.search:{query}',
+        'sort': 'publication_date:desc',
+        'mailto': email,
+        'per_page': min(OPENALEX_PER_PAGE, max_results),
+    }
+
+    # 如果指定了时间范围，添加日期过滤
+    if since_hours > 0:
+        now = datetime.now(timezone.utc)
+        threshold = now - timedelta(hours=since_hours)
+        # OpenAlex 使用 YYYY-MM-DD 格式
+        from_date = threshold.strftime('%Y-%m-%d')
+        params['filter'] += f',from_publication_date:{from_date}'
+
+    papers = []
+    page = 1
+
+    while len(papers) < max_results:
+        try:
+            params['page'] = page
+            response = session.get(
+                OPENALEX_BASE_URL,
+                params=params,
+                timeout=OPENALEX_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            results = data.get('results', [])
+            if not results:
+                break
+
+            for work in results:
+                if len(papers) >= max_results:
+                    break
+
+                # 提取 ArXiv ID 和 URL
+                arxiv_id = None
+                arxiv_url = None
+
+                # 从 ids 字段中提取 ArXiv ID
+                ids = work.get('ids', {})
+                if 'arxiv' in ids:
+                    arxiv_url = ids['arxiv']
+                    # 从 URL 中提取 ID
+                    if arxiv_url:
+                        match = re.search(r'arxiv\.org/abs/(\S+)', arxiv_url)
+                        if match:
+                            arxiv_id = match.group(1)
+
+                # 如果没有找到 ArXiv URL，尝试从 locations 中查找
+                if not arxiv_url:
+                    locations = work.get('locations', [])
+                    for loc in locations:
+                        landing_page = loc.get('landing_page_url', '')
+                        if 'arxiv.org' in landing_page:
+                            arxiv_url = landing_page
+                            match = re.search(r'arxiv\.org/abs/(\S+)', landing_page)
+                            if match:
+                                arxiv_id = match.group(1)
+                            break
+
+                # 如果还是没有找到，跳过这篇论文
+                if not arxiv_url:
+                    continue
+
+                # 提取摘要
+                abstract = work.get('abstract', '')
+                if not abstract:
+                    # 如果没有摘要，尝试使用 abstract_inverted_index
+                    inv_index = work.get('abstract_inverted_index', {})
+                    if inv_index:
+                        # 重建摘要文本
+                        words = []
+                        for word, positions in inv_index.items():
+                            for pos in positions:
+                                words.append((pos, word))
+                        words.sort()
+                        abstract = ' '.join([w[1] for w in words])
+
+                # 提取发布日期
+                pub_date_str = work.get('publication_date')
+                published = None
+                if pub_date_str:
+                    try:
+                        published = datetime.strptime(pub_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        pass
+
+                # 构建与 ArXiv API 兼容的论文对象（使用简单的字典模拟 arxiv.Result）
+                class PaperResult:
+                    def __init__(self, title, summary, entry_id, published):
+                        self.title = title
+                        self.summary = summary
+                        self.entry_id = entry_id
+                        self.published = published
+
+                paper = PaperResult(
+                    title=work.get('display_name', '').strip(),
+                    summary=abstract.strip() if abstract else '',
+                    entry_id=arxiv_url,
+                    published=published,
+                )
+
+                papers.append(paper)
+
+            # 检查是否还有更多结果
+            meta = data.get('meta', {})
+            if page * params['per_page'] >= meta.get('count', 0):
+                break
+
+            page += 1
+            time.sleep(REQUEST_INTERVAL)  # 避免请求过快
+
+        except requests.exceptions.RequestException as e:
+            print(f"OpenAlex API 请求失败: {str(e)}", file=sys.stderr)
+            break
+        except Exception as e:
+            print(f"解析 OpenAlex 响应时出错: {str(e)}", file=sys.stderr)
+            break
+
+    print(f"从 OpenAlex 获取到 {len(papers)} 篇论文")
+    return papers
+
+
 def _write_github_step_summary(markdown: str) -> None:
     path = os.getenv("GITHUB_STEP_SUMMARY")
     if not path:
@@ -474,6 +624,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--query", default=_getenv_str("ARXIV_QUERY", DEFAULT_ARXIV_QUERY))
     parser.add_argument("--max-results", type=int, default=_getenv_int("MAX_RESULTS", DEFAULT_MAX_RESULTS))
     parser.add_argument("--since-hours", type=float, default=_getenv_float("SINCE_HOURS", DEFAULT_SINCE_HOURS))
+
+    # OpenAlex API 配置
+    parser.add_argument("--openalex-email", default=_getenv_str("OPENALEX_EMAIL"), help="Email for OpenAlex Polite Pool")
 
     parser.add_argument("--feishu-webhook", default=_getenv_str("FEISHU_WEBHOOK"))
     parser.add_argument("--per-paper", action="store_true", default=_strtobool(os.getenv("FEISHU_PER_PAPER")))
@@ -504,6 +657,9 @@ def main() -> int:
     if not args.skip_llm and not args.deepseek_api_key:
         print("缺少 DEEPSEEK_API_KEY：请在环境变量或参数中设置 --deepseek-api-key，或使用 --skip-llm。", file=sys.stderr)
         return 2
+    if not args.openalex_email:
+        print("缺少 OPENALEX_EMAIL：请在环境变量或参数中设置 --openalex-email。", file=sys.stderr)
+        return 2
 
     prompt_template = None
     if not args.skip_llm:
@@ -515,23 +671,14 @@ def main() -> int:
             return 2
 
     print("正在搜集最新论文...")
-    # 配置 ArXiv 客户端，添加速率限制和重试机制
-    client = arxiv.Client(
-        page_size=ARXIV_PAGE_SIZE,
-        delay_seconds=ARXIV_DELAY_SECONDS,
-        num_retries=ARXIV_NUM_RETRIES
-    )
-    search = arxiv.Search(
+    # 使用 OpenAlex API 获取论文
+    results = fetch_papers_from_openalex(
         query=args.query,
         max_results=args.max_results,
-        sort_by=arxiv.SortCriterion.SubmittedDate,
+        since_hours=args.since_hours,
+        email=args.openalex_email,
+        session=session,
     )
-
-    results = list(client.results(search))
-    if args.since_hours > 0:
-        now = datetime.now(timezone.utc)
-        threshold = now - timedelta(hours=float(args.since_hours))
-        results = [r for r in results if getattr(r, "published", None) and r.published.replace(tzinfo=timezone.utc) >= threshold]
 
     if not results:
         msg = "今日暂无新论文。"

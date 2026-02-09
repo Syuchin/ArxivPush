@@ -35,4 +35,5 @@ jobs:
           # Required (Repository → Settings → Secrets and variables → Actions → Secrets)
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
         run: python daily_paper.py
