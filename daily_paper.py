@@ -65,6 +65,11 @@ RETRY_DELAY = 2  # 秒
 # 请求间隔（秒）- 避免瞬间发送过多请求
 REQUEST_INTERVAL = 0.5
 
+# ArXiv API 配置
+ARXIV_PAGE_SIZE = 50  # 每次请求的结果数量
+ARXIV_DELAY_SECONDS = 3.0  # 请求之间的延迟（秒）
+ARXIV_NUM_RETRIES = 5  # 重试次数
+
 # 预编译正则：匹配【相关性】X/5 格式的评分
 _SCORE_RE = re.compile(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5')
 
@@ -510,7 +515,12 @@ def main() -> int:
             return 2
 
     print("正在搜集最新论文...")
-    client = arxiv.Client()
+    # 配置 ArXiv 客户端，添加速率限制和重试机制
+    client = arxiv.Client(
+        page_size=ARXIV_PAGE_SIZE,
+        delay_seconds=ARXIV_DELAY_SECONDS,
+        num_retries=ARXIV_NUM_RETRIES
+    )
     search = arxiv.Search(
         query=args.query,
         max_results=args.max_results,
