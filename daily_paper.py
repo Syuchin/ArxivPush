@@ -6,7 +6,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from threading import Semaphore
+from threading import Lock
 from typing import Any, Optional
 
 import requests
@@ -61,14 +61,14 @@ DEFAULT_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 DEFAULT_MAX_TOKENS = 2000
 
 # 并发处理线程数（严格控制同时进行的 API 请求数）
-MAX_WORKERS = 3
+MAX_WORKERS = 2
 
 # 重试配置
 MAX_RETRIES = 3
-RETRY_DELAY = 2  # 秒
+RETRY_DELAY = 5  # 秒
 
-# 请求间隔（秒）- 避免瞬间发送过多请求
-REQUEST_INTERVAL = 0.5
+# 请求间隔（秒）- 全局节流，确保任意两次 LLM 请求之间至少间隔此时间
+REQUEST_INTERVAL = 1.5
 
 # OpenAlex API 配置
 OPENALEX_PER_PAGE = 50  # 每次请求的结果数量
@@ -177,7 +177,8 @@ def _process_single_paper(
     api_url: str,
     model: str,
     max_tokens: int,
-    semaphore: Semaphore,
+    throttle_lock: Lock,
+    last_request_time: list,
 ) -> dict:
     """处理单篇论文（用于并发）"""
     print(f"正在分析第 {index}/{total} 篇: {res.title}")
@@ -194,19 +195,22 @@ def _process_single_paper(
         score = 3.0
     else:
         try:
-            # 使用信号量控制并发 API 请求数
-            with semaphore:
-                # 添加请求间隔，避免瞬间发送过多请求
-                time.sleep(REQUEST_INTERVAL)
-                analysis = summarize_with_deepseek(
-                    paper_info,
-                    prompt_template=prompt_template,
-                    api_key=api_key,
-                    api_url=api_url,
-                    model=model,
-                    max_tokens=max_tokens,
-                    session=session,
-                )
+            # 全局节流：确保任意两次 LLM 请求之间至少间隔 REQUEST_INTERVAL 秒
+            with throttle_lock:
+                elapsed = time.time() - last_request_time[0]
+                if elapsed < REQUEST_INTERVAL:
+                    time.sleep(REQUEST_INTERVAL - elapsed)
+                last_request_time[0] = time.time()
+
+            analysis = summarize_with_deepseek(
+                paper_info,
+                prompt_template=prompt_template,
+                api_key=api_key,
+                api_url=api_url,
+                model=model,
+                max_tokens=max_tokens,
+                session=session,
+            )
             # 打印 LLM 返回的原始内容（用于调试）
             print(f"\n=== 论文 {index} LLM 返回内容 ===")
             print(analysis)
@@ -792,11 +796,10 @@ def main() -> int:
 
     print(f"开始并发分析 {total} 篇论文（并发数：{MAX_WORKERS}）...")
 
-    # 创建信号量，严格控制同时进行的 API 请求数
-    api_semaphore = Semaphore(MAX_WORKERS)
+    # 创建全局节流锁，确保任意两次 LLM 请求之间至少间隔 REQUEST_INTERVAL 秒
+    throttle_lock = Lock()
+    last_request_time = [0.0]  # 用 list 包装以便在闭包中修改
 
-    # ThreadPoolExecutor 的 max_workers 设为 MAX_WORKERS 即可
-    # Semaphore 已经控制了并发 API 请求数，不需要额外的线程
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # 提交所有任务
         future_to_index = {
@@ -812,7 +815,8 @@ def main() -> int:
                 api_url=args.deepseek_api_url,
                 model=args.deepseek_model,
                 max_tokens=args.deepseek_max_tokens,
-                semaphore=api_semaphore,
+                throttle_lock=throttle_lock,
+                last_request_time=last_request_time,
             ): i
             for i, res in enumerate(results, start=1)
         }
