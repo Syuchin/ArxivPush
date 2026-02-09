@@ -65,6 +65,12 @@ RETRY_DELAY = 2  # 秒
 # 请求间隔（秒）- 避免瞬间发送过多请求
 REQUEST_INTERVAL = 0.5
 
+# 预编译正则：匹配【相关性】X/5 格式的评分
+_SCORE_RE = re.compile(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5')
+
+# 预编译正则：匹配【标签名】内容 格式的分析段落
+_SECTION_RE = re.compile(r'【([^】]+)】\s*(.*?)(?=【|$)', re.DOTALL)
+
 
 def _strtobool(v: Optional[str]) -> bool:
     if v is None:
@@ -248,7 +254,6 @@ def summarize_with_deepseek(
     }
 
     # 重试逻辑
-    last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             resp = session.post(api_url, headers=headers, json=payload, timeout=timeout_s)
@@ -282,35 +287,29 @@ def summarize_with_deepseek(
 
             return content.strip()
 
-        except requests.exceptions.Timeout as e:
-            last_error = e
-            if attempt < MAX_RETRIES - 1:
+        except (requests.exceptions.Timeout, requests.exceptions.HTTPError, Exception) as e:
+            is_last_attempt = attempt == MAX_RETRIES - 1
+
+            # 429 错误使用指数退避，其他错误使用线性退避
+            if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
+                wait_time = RETRY_DELAY * (attempt + 2) * 2
+                error_msg = "API 限流"
+            else:
                 wait_time = RETRY_DELAY * (attempt + 1)
-                print(f"请求超时，{wait_time} 秒后重试（第 {attempt + 1}/{MAX_RETRIES} 次）...")
-                time.sleep(wait_time)
-            continue
+                error_msg = "请求超时" if isinstance(e, requests.exceptions.Timeout) else f"请求失败: {str(e)}"
 
-        except requests.exceptions.HTTPError as e:
-            last_error = e
-            # 429 错误需要更长的等待时间
-            if e.response.status_code == 429 and attempt < MAX_RETRIES - 1:
-                wait_time = RETRY_DELAY * (attempt + 2) * 2  # 指数退避
-                print(f"API 限流，{wait_time} 秒后重试（第 {attempt + 1}/{MAX_RETRIES} 次）...")
+            if not is_last_attempt:
+                print(f"{error_msg}，{wait_time} 秒后重试（第 {attempt + 1}/{MAX_RETRIES} 次）...")
                 time.sleep(wait_time)
-                continue
-            raise
+            else:
+                # 最后一次尝试失败，抛出异常
+                raise
 
-        except Exception as e:
-            last_error = e
-            if attempt < MAX_RETRIES - 1:
-                wait_time = RETRY_DELAY * (attempt + 1)
-                print(f"请求失败: {str(e)}，{wait_time} 秒后重试（第 {attempt + 1}/{MAX_RETRIES} 次）...")
-                time.sleep(wait_time)
-                continue
-            raise
 
-    # 所有重试都失败
-    raise last_error
+def _extract_section(analysis: str, section_name: str) -> Optional[str]:
+    """从分析文本中提取指定段落的内容"""
+    match = re.search(rf'【{re.escape(section_name)}】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
+    return match.group(1).strip() if match else None
 
 
 def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> dict[str, Any]:
@@ -318,8 +317,9 @@ def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> di
     elements = []
 
     for i, paper in enumerate(papers):
-        # 提取评分
         analysis = paper['analysis']
+
+        # 提取评分
         score_match = re.search(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5', analysis)
         score_text = f"<font color='red'>({score_match.group(1)}/5)</font>" if score_match else ""
 
@@ -349,19 +349,16 @@ def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> di
         elements.append({"tag": "action", "actions": actions})
 
         # 合并：问题定义 + 方法核心 + 主要发现
+        core_sections = [
+            ("问题定义", "violet"),
+            ("方法核心", "blue"),
+            ("主要发现", "violet"),
+        ]
         core_content = []
-
-        problem_match = re.search(r'【问题定义】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
-        if problem_match:
-            core_content.append(f"<font color='violet'>**【问题定义】**</font>\n{problem_match.group(1).strip()}")
-
-        method_match = re.search(r'【方法核心】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
-        if method_match:
-            core_content.append(f"<font color='blue'>**【方法核心】**</font>\n{method_match.group(1).strip()}")
-
-        finding_match = re.search(r'【主要发现】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
-        if finding_match:
-            core_content.append(f"<font color='violet'>**【主要发现】**</font>\n{finding_match.group(1).strip()}")
+        for section_name, color in core_sections:
+            content = _extract_section(analysis, section_name)
+            if content:
+                core_content.append(f"<font color='{color}'>**【{section_name}】**</font>\n{content}")
 
         if core_content:
             elements.append({
@@ -373,15 +370,15 @@ def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> di
             })
 
         # 合并：局限性推测 + 潜在关联
+        analysis_sections = [
+            ("局限性推测", "orange"),
+            ("潜在关联", "green"),
+        ]
         analysis_content = []
-
-        limitation_match = re.search(r'【局限性推测】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
-        if limitation_match:
-            analysis_content.append(f"<font color='orange'>**【局限性推测】**</font>\n{limitation_match.group(1).strip()}")
-
-        relation_match = re.search(r'【潜在关联】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
-        if relation_match:
-            analysis_content.append(f"<font color='green'>**【潜在关联】**</font>\n{relation_match.group(1).strip()}")
+        for section_name, color in analysis_sections:
+            content = _extract_section(analysis, section_name)
+            if content:
+                analysis_content.append(f"<font color='{color}'>**【{section_name}】**</font>\n{content}")
 
         if analysis_content:
             elements.append({
@@ -393,14 +390,13 @@ def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> di
             })
 
         # 提取一句话结论
-        conclusion_match = re.search(r'【一句话结论】\s*(.*?)(?=【|$)', analysis, re.DOTALL)
-        if conclusion_match:
-            conclusion_text = conclusion_match.group(1).strip()
+        conclusion = _extract_section(analysis, "一句话结论")
+        if conclusion:
             elements.append({
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"<font color='blue'>**【一句话结论】**</font>\n{conclusion_text}"
+                    "content": f"<font color='blue'>**【一句话结论】**</font>\n{conclusion}"
                 }
             })
 
@@ -550,7 +546,9 @@ def main() -> int:
     # 创建信号量，严格控制同时进行的 API 请求数
     api_semaphore = Semaphore(MAX_WORKERS)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS * 2) as executor:
+    # ThreadPoolExecutor 的 max_workers 设为 MAX_WORKERS 即可
+    # Semaphore 已经控制了并发 API 请求数，不需要额外的线程
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # 提交所有任务
         future_to_index = {
             executor.submit(
