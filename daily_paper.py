@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
 
 PWC_BASE_URL = "https://arxiv.paperswithcode.com/api/v0/papers/"
 OPENALEX_BASE_URL = "https://api.openalex.org/works"
+PUSHED_IDS_FILE = "pushed_ids.txt"  # 存储已推送论文 ID 的文件
 
 # ============ 配置常量（不隐私的配置直接写死） ============
 
@@ -36,8 +37,9 @@ DEFAULT_ARXIV_QUERY = 'LLM safety OR agent safety OR AI agent OR language model 
 # 每次获取论文数量（会获取更多论文，然后按评分筛选）
 DEFAULT_MAX_RESULTS = 50  # 获取 50 篇，筛选出评分 >= 3 的前 20 篇
 
-# 时间范围（小时）：0 表示不限制
-DEFAULT_SINCE_HOURS = 0.0
+# 时间范围（小时）：获取最近 N 小时内添加到 OpenAlex 的论文
+# 设置为 48 小时（2 天）以覆盖 OpenAlex 的同步延迟
+DEFAULT_SINCE_HOURS = 48.0
 
 # 最低评分阈值（低于此分数的论文不推送）
 MIN_SCORE_THRESHOLD = 3.0
@@ -465,6 +467,7 @@ def fetch_papers_from_openalex(
     since_hours: float,
     email: str,
     session: requests.Session,
+    api_key: Optional[str] = None,
 ) -> list[dict]:
     """
     从 OpenAlex API 获取 ArXiv 论文
@@ -475,6 +478,7 @@ def fetch_papers_from_openalex(
         since_hours: 只获取最近 N 小时内的论文（0 表示不限制）
         email: 用于 Polite Pool 的邮箱地址
         session: requests.Session 对象
+        api_key: OpenAlex API Key（可选，用于访问高级功能如 from_created_date）
 
     Returns:
         论文列表，每个论文是一个字典，包含 title, summary, entry_id, published 等字段
@@ -482,9 +486,15 @@ def fetch_papers_from_openalex(
     print(f"正在从 OpenAlex API 查询论文（关键词：{query}）...")
 
     # 构建查询参数
+    # 如果有 API Key，使用 from_created_date（更准确）
+    # 否则使用 from_publication_date
+    use_created_date = api_key is not None
+    date_filter_type = 'from_created_date' if use_created_date else 'from_publication_date'
+    sort_field = 'created_date' if use_created_date else 'publication_date'
+
     params = {
         'filter': f'indexed_in:arxiv,title.search:{query}',
-        'sort': 'publication_date:desc',
+        'sort': f'{sort_field}:desc',
         'mailto': email,
         'per_page': min(OPENALEX_PER_PAGE, max_results),
     }
@@ -495,7 +505,11 @@ def fetch_papers_from_openalex(
         threshold = now - timedelta(hours=since_hours)
         # OpenAlex 使用 YYYY-MM-DD 格式
         from_date = threshold.strftime('%Y-%m-%d')
-        params['filter'] += f',from_publication_date:{from_date}'
+        params['filter'] += f',{date_filter_type}:{from_date}'
+        if use_created_date:
+            print(f"过滤条件：只获取 {from_date} 之后添加到 OpenAlex 的论文（使用 API Key）")
+        else:
+            print(f"过滤条件：只获取 {from_date} 之后发布的论文")
 
     papers = []
     page = 1
@@ -503,9 +517,16 @@ def fetch_papers_from_openalex(
     while len(papers) < max_results:
         try:
             params['page'] = page
+
+            # 如果有 API Key，添加到请求头
+            headers = {}
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
+
             response = session.get(
                 OPENALEX_BASE_URL,
                 params=params,
+                headers=headers,
                 timeout=OPENALEX_TIMEOUT
             )
             response.raise_for_status()
@@ -572,19 +593,24 @@ def fetch_papers_from_openalex(
                     except ValueError:
                         pass
 
+                # 提取 OpenAlex ID（用于去重）
+                openalex_id = work.get('id', '')
+
                 # 构建与 ArXiv API 兼容的论文对象（使用简单的字典模拟 arxiv.Result）
                 class PaperResult:
-                    def __init__(self, title, summary, entry_id, published):
+                    def __init__(self, title, summary, entry_id, published, openalex_id):
                         self.title = title
                         self.summary = summary
                         self.entry_id = entry_id
                         self.published = published
+                        self.openalex_id = openalex_id  # 用于去重
 
                 paper = PaperResult(
                     title=work.get('display_name', '').strip(),
                     summary=abstract.strip() if abstract else '',
                     entry_id=arxiv_url,
                     published=published,
+                    openalex_id=openalex_id,
                 )
 
                 papers.append(paper)
@@ -616,6 +642,43 @@ def _write_github_step_summary(markdown: str) -> None:
         with open(path, "a", encoding="utf-8") as f:
             f.write(markdown.rstrip() + "\n")
     except OSError:
+        pass
+
+
+def load_pushed_ids() -> set[str]:
+    """加载已推送的论文 ID 列表"""
+    if not os.path.exists(PUSHED_IDS_FILE):
+        return set()
+    try:
+        with open(PUSHED_IDS_FILE, 'r', encoding='utf-8') as f:
+            # 只保留最近 500 条记录，避免文件过大
+            ids = [line.strip() for line in f if line.strip()]
+            return set(ids[-500:])
+    except Exception as e:
+        print(f"读取已推送 ID 文件失败: {e}", file=sys.stderr)
+        return set()
+
+
+def save_pushed_ids(ids: set[str]) -> None:
+    """保存已推送的论文 ID 列表"""
+    try:
+        # 只保留最近 500 条记录
+        ids_list = list(ids)[-500:]
+        with open(PUSHED_IDS_FILE, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(ids_list))
+        print(f"已更新推送记录文件，当前记录数: {len(ids_list)}")
+    except Exception as e:
+        print(f"保存已推送 ID 文件失败: {e}", file=sys.stderr)
+
+
+def _write_github_step_summary(markdown: str) -> None:
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(markdown.rstrip() + "\n")
+    except OSError:
         return
 
 
@@ -627,6 +690,7 @@ def _parse_args() -> argparse.Namespace:
 
     # OpenAlex API 配置
     parser.add_argument("--openalex-email", default=_getenv_str("OPENALEX_EMAIL"), help="Email for OpenAlex Polite Pool")
+    parser.add_argument("--openalex-api-key", default=_getenv_str("OPENALEX_API_KEY"), help="OpenAlex API Key (optional, for advanced features)")
 
     parser.add_argument("--feishu-webhook", default=_getenv_str("FEISHU_WEBHOOK"))
     parser.add_argument("--per-paper", action="store_true", default=_strtobool(os.getenv("FEISHU_PER_PAPER")))
@@ -678,10 +742,35 @@ def main() -> int:
         since_hours=args.since_hours,
         email=args.openalex_email,
         session=session,
+        api_key=args.openalex_api_key,
     )
 
     if not results:
         msg = "今日暂无新论文。"
+        print(msg)
+        _write_github_step_summary(f"## ArXiv 每日推送\n\n{msg}\n")
+        if not args.dry_run and args.feishu_webhook:
+            push_to_feishu(
+                msg,
+                webhook=args.feishu_webhook,
+                session=session,
+                title=f"🚀 ArXiv {datetime.now().strftime('%m-%d')}",
+                footer_note="自动生成：无新论文",
+            )
+        return 0
+
+    # 加载已推送的论文 ID 并进行去重
+    pushed_ids = load_pushed_ids()
+    original_count = len(results)
+
+    # 过滤掉已推送的论文
+    results = [r for r in results if getattr(r, 'openalex_id', '') not in pushed_ids]
+
+    if len(results) < original_count:
+        print(f"去重：过滤掉 {original_count - len(results)} 篇已推送的论文，剩余 {len(results)} 篇")
+
+    if not results:
+        msg = "今日无新论文（所有论文均已推送过）。"
         print(msg)
         _write_github_step_summary(f"## ArXiv 每日推送\n\n{msg}\n")
         if not args.dry_run and args.feishu_webhook:
@@ -795,6 +884,13 @@ def main() -> int:
             title=card_title,
             footer_note=footer_note,
         )
+
+    # 保存已推送的论文 ID
+    # 从 results 中提取所有被处理的论文的 OpenAlex ID
+    processed_ids = {getattr(r, 'openalex_id', '') for r in results if getattr(r, 'openalex_id', '')}
+    if processed_ids:
+        pushed_ids.update(processed_ids)
+        save_pushed_ids(pushed_ids)
 
     print("推送成功！")
     return 0

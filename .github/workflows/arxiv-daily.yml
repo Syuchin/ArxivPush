@@ -2,8 +2,9 @@ name: ArXiv Daily Paper Push
 
 on:
   schedule:
-    # GitHub Actions cron uses UTC (北京时间 8:00 = UTC 0:00)
-    - cron: "0 0 * * *"
+    # GitHub Actions cron uses UTC (北京时间 22:00 = UTC 14:00)
+    # 晚 10 点运行可以确保 OpenAlex 已同步当天的 ArXiv 论文
+    - cron: "0 14 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write  # 允许提交 pushed_ids.txt 文件
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,4 +37,13 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
         run: python daily_paper.py
+
+      - name: Commit pushed IDs
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add pushed_ids.txt
+          git diff --staged --quiet || git commit -m "Update pushed papers log [skip ci]"
+          git push
