@@ -3,8 +3,10 @@ import json
 import os
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from threading import Semaphore
 from typing import Any, Optional
 
 import arxiv
@@ -53,8 +55,15 @@ DEFAULT_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 # 默认 max_tokens（GLM-4.7 需要更多 tokens 用于推理）
 DEFAULT_MAX_TOKENS = 2000
 
-# 并发处理线程数
+# 并发处理线程数（严格控制同时进行的 API 请求数）
 MAX_WORKERS = 3
+
+# 重试配置
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # 秒
+
+# 请求间隔（秒）- 避免瞬间发送过多请求
+REQUEST_INTERVAL = 0.5
 
 
 def _strtobool(v: Optional[str]) -> bool:
@@ -153,6 +162,7 @@ def _process_single_paper(
     api_url: str,
     model: str,
     max_tokens: int,
+    semaphore: Semaphore,
 ) -> dict:
     """处理单篇论文（用于并发）"""
     print(f"正在分析第 {index}/{total} 篇: {res.title}")
@@ -169,15 +179,19 @@ def _process_single_paper(
         score = 3.0
     else:
         try:
-            analysis = summarize_with_deepseek(
-                paper_info,
-                prompt_template=prompt_template,
-                api_key=api_key,
-                api_url=api_url,
-                model=model,
-                max_tokens=max_tokens,
-                session=session,
-            )
+            # 使用信号量控制并发 API 请求数
+            with semaphore:
+                # 添加请求间隔，避免瞬间发送过多请求
+                time.sleep(REQUEST_INTERVAL)
+                analysis = summarize_with_deepseek(
+                    paper_info,
+                    prompt_template=prompt_template,
+                    api_key=api_key,
+                    api_url=api_url,
+                    model=model,
+                    max_tokens=max_tokens,
+                    session=session,
+                )
             # 打印 LLM 返回的原始内容（用于调试）
             print(f"\n=== 论文 {index} LLM 返回内容 ===")
             print(analysis)
@@ -206,7 +220,7 @@ def summarize_with_deepseek(
     model: str,
     max_tokens: int,
     session: requests.Session,
-    timeout_s: int = 60,
+    timeout_s: int = 120,  # 增加超时时间到 120 秒
 ) -> str:
     """使用 DeepSeek（OpenAI Chat Completions 兼容）进行论文深度总结。"""
     prompt_text = prompt_template.render(**paper).strip()
@@ -233,35 +247,70 @@ def summarize_with_deepseek(
         "Authorization": f"Bearer {api_key}",
     }
 
-    resp = session.post(api_url, headers=headers, json=payload, timeout=timeout_s)
-    resp.raise_for_status()
-    res_json = resp.json()
+    # 重试逻辑
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = session.post(api_url, headers=headers, json=payload, timeout=timeout_s)
+            resp.raise_for_status()
+            res_json = resp.json()
 
-    if isinstance(res_json, dict) and "error" in res_json:
-        err = res_json.get("error") or {}
-        message = err.get("message") if isinstance(err, dict) else None
-        raise RuntimeError(f"DeepSeek API 报错: {message or json.dumps(res_json, ensure_ascii=False)}")
+            if isinstance(res_json, dict) and "error" in res_json:
+                err = res_json.get("error") or {}
+                message = err.get("message") if isinstance(err, dict) else None
+                raise RuntimeError(f"DeepSeek API 报错: {message or json.dumps(res_json, ensure_ascii=False)}")
 
-    choices = res_json.get("choices") if isinstance(res_json, dict) else None
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError(f"API 未预期响应: {json.dumps(res_json, ensure_ascii=False)}")
+            choices = res_json.get("choices") if isinstance(res_json, dict) else None
+            if not isinstance(choices, list) or not choices:
+                raise RuntimeError(f"API 未预期响应: {json.dumps(res_json, ensure_ascii=False)}")
 
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
 
-    # GLM-4.7 等推理模型可能将内容放在 reasoning_content 中
-    content = None
-    if isinstance(message, dict):
-        content = message.get("content")
-        # 如果 content 为空，尝试从 reasoning_content 中提取
-        if not content or not content.strip():
-            reasoning_content = message.get("reasoning_content")
-            if reasoning_content:
-                print("警告：模型返回的 content 为空，使用 reasoning_content")
-                content = reasoning_content
+            # GLM-4.7 等推理模型可能将内容放在 reasoning_content 中
+            content = None
+            if isinstance(message, dict):
+                content = message.get("content")
+                # 如果 content 为空，尝试从 reasoning_content 中提取
+                if not content or not content.strip():
+                    reasoning_content = message.get("reasoning_content")
+                    if reasoning_content:
+                        print("警告：模型返回的 content 为空，使用 reasoning_content")
+                        content = reasoning_content
 
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError(f"API 未返回 content: {json.dumps(res_json, ensure_ascii=False)}")
-    return content.strip()
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError(f"API 未返回 content: {json.dumps(res_json, ensure_ascii=False)}")
+
+            return content.strip()
+
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                wait_time = RETRY_DELAY * (attempt + 1)
+                print(f"请求超时，{wait_time} 秒后重试（第 {attempt + 1}/{MAX_RETRIES} 次）...")
+                time.sleep(wait_time)
+            continue
+
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            # 429 错误需要更长的等待时间
+            if e.response.status_code == 429 and attempt < MAX_RETRIES - 1:
+                wait_time = RETRY_DELAY * (attempt + 2) * 2  # 指数退避
+                print(f"API 限流，{wait_time} 秒后重试（第 {attempt + 1}/{MAX_RETRIES} 次）...")
+                time.sleep(wait_time)
+                continue
+            raise
+
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                wait_time = RETRY_DELAY * (attempt + 1)
+                print(f"请求失败: {str(e)}，{wait_time} 秒后重试（第 {attempt + 1}/{MAX_RETRIES} 次）...")
+                time.sleep(wait_time)
+                continue
+            raise
+
+    # 所有重试都失败
+    raise last_error
 
 
 def _feishu_card_payload(title: str, papers: list[dict], footer_note: str) -> dict[str, Any]:
@@ -498,7 +547,10 @@ def main() -> int:
 
     print(f"开始并发分析 {total} 篇论文（并发数：{MAX_WORKERS}）...")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    # 创建信号量，严格控制同时进行的 API 请求数
+    api_semaphore = Semaphore(MAX_WORKERS)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS * 2) as executor:
         # 提交所有任务
         future_to_index = {
             executor.submit(
@@ -513,6 +565,7 @@ def main() -> int:
                 api_url=args.deepseek_api_url,
                 model=args.deepseek_model,
                 max_tokens=args.deepseek_max_tokens,
+                semaphore=api_semaphore,
             ): i
             for i, res in enumerate(results, start=1)
         }
