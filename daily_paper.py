@@ -65,10 +65,10 @@ RETRY_DELAY = 2  # 秒
 # 请求间隔（秒）- 避免瞬间发送过多请求
 REQUEST_INTERVAL = 0.5
 
-# ArXiv API 配置
-ARXIV_PAGE_SIZE = 50  # 每次请求的结果数量
-ARXIV_DELAY_SECONDS = 3.0  # 请求之间的延迟（秒）
-ARXIV_NUM_RETRIES = 5  # 重试次数
+# ArXiv API 配置（GitHub Actions 环境需要更保守的参数）
+ARXIV_PAGE_SIZE = 10  # 每次请求的结果数量（减少以避免触发速率限制）
+ARXIV_DELAY_SECONDS = 10.0  # 请求之间的延迟（秒）- 增加到 10 秒
+ARXIV_NUM_RETRIES = 10  # 重试次数 - 增加重试次数
 
 # 预编译正则：匹配【相关性】X/5 格式的评分
 _SCORE_RE = re.compile(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5')

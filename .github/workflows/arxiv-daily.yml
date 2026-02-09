@@ -2,8 +2,8 @@ name: ArXiv Daily Paper Push
 
 on:
   schedule:
-    # GitHub Actions cron uses UTC
-    - cron: "30 1 * * *"
+    # GitHub Actions cron uses UTC (北京时间 8:00 = UTC 0:00)
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 concurrency:
