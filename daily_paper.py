@@ -781,13 +781,27 @@ def main() -> int:
         print(msg)
         _write_github_step_summary(f"## ArXiv 每日推送\n\n{msg}\n")
         if not args.dry_run and args.feishu_webhook:
-            push_to_feishu(
-                msg,
-                webhook=args.feishu_webhook,
-                session=session,
-                title=f"🚀 ArXiv {datetime.now().strftime('%m-%d')}",
-                footer_note="自动生成：无新论文",
+            # 无新论文时发送简单文本消息，而非富文本卡片
+            payload = {
+                "msg_type": "interactive",
+                "card": {
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"🚀 ArXiv {datetime.now().strftime('%m-%d')}"},
+                        "template": "blue"
+                    },
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": msg}},
+                        {"tag": "note", "elements": [{"tag": "plain_text", "content": "自动生成：无新论文"}]}
+                    ]
+                }
+            }
+            resp = session.post(
+                args.feishu_webhook,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=15,
             )
+            resp.raise_for_status()
         return 0
 
     # 第一步：并发分析所有论文并提取评分
