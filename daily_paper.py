@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -51,6 +52,9 @@ DEFAULT_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
 # 默认 max_tokens（GLM-4.7 需要更多 tokens 用于推理）
 DEFAULT_MAX_TOKENS = 2000
+
+# 并发处理线程数
+MAX_WORKERS = 3
 
 
 def _strtobool(v: Optional[str]) -> bool:
@@ -136,6 +140,62 @@ def _extract_score(analysis: str) -> float:
     return 3.0  # 默认中等评分
 
 
+def _process_single_paper(
+    res,
+    index: int,
+    total: int,
+    *,
+    session: requests.Session,
+    skip_llm: bool,
+    prompt_template,
+    api_key: str,
+    api_url: str,
+    model: str,
+    max_tokens: int,
+) -> dict:
+    """处理单篇论文（用于并发）"""
+    print(f"正在分析第 {index}/{total} 篇: {res.title}")
+
+    code_url = get_code_link(res.entry_id, session=session)
+    paper_info = {
+        "title": res.title.strip(),
+        "summary": (res.summary or "").replace("\n", " ").strip(),
+        "url": res.entry_id,
+    }
+
+    if skip_llm:
+        analysis = f"【摘要（未调用 LLM）】\n{paper_info['summary']}\n"
+        score = 3.0
+    else:
+        try:
+            analysis = summarize_with_deepseek(
+                paper_info,
+                prompt_template=prompt_template,
+                api_key=api_key,
+                api_url=api_url,
+                model=model,
+                max_tokens=max_tokens,
+                session=session,
+            )
+            # 打印 LLM 返回的原始内容（用于调试）
+            print(f"\n=== 论文 {index} LLM 返回内容 ===")
+            print(analysis)
+            print("===================\n")
+            score = _extract_score(analysis)
+        except Exception as e:
+            print(f"论文 {index} LLM 调用失败: {str(e)}")
+            analysis = f"【LLM 解析失败】{str(e)}\n\n【摘要】{paper_info['summary']}"
+            score = 3.0
+
+    return {
+        "title": paper_info["title"],
+        "url": paper_info["url"],
+        "code_url": code_url,
+        "analysis": analysis,
+        "score": score,
+    }
+
+
 def summarize_with_deepseek(
     paper: dict[str, str],
     *,
@@ -159,8 +219,11 @@ def summarize_with_deepseek(
             },
             {"role": "user", "content": prompt_text},
         ],
-        "temperature": 0.2,
+        "temperature": 1.0,
         "stream": False,
+        "thinking": {
+            "type": "disabled"
+        },
         "max_tokens": max_tokens,
     }
 
@@ -428,49 +491,40 @@ def main() -> int:
             )
         return 0
 
-    # 第一步：分析所有论文并提取评分
+    # 第一步：并发分析所有论文并提取评分
     paper_data: list[dict] = []
     total = len(results)
-    for i, res in enumerate(results, start=1):
-        print(f"正在分析第 {i}/{total} 篇: {res.title}")
-        code_url = get_code_link(res.entry_id, session=session)
-        paper_info = {
-            "title": res.title.strip(),
-            "summary": (res.summary or "").replace("\n", " ").strip(),
-            "url": res.entry_id,
+
+    print(f"开始并发分析 {total} 篇论文（并发数：{MAX_WORKERS}）...")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 提交所有任务
+        future_to_index = {
+            executor.submit(
+                _process_single_paper,
+                res,
+                i,
+                total,
+                session=session,
+                skip_llm=args.skip_llm,
+                prompt_template=prompt_template,
+                api_key=args.deepseek_api_key,
+                api_url=args.deepseek_api_url,
+                model=args.deepseek_model,
+                max_tokens=args.deepseek_max_tokens,
+            ): i
+            for i, res in enumerate(results, start=1)
         }
 
-        if args.skip_llm:
-            analysis = f"【摘要（未调用 LLM）】\n{paper_info['summary']}\n"
-            score = 3.0
-        else:
+        # 收集结果
+        for future in as_completed(future_to_index):
             try:
-                analysis = summarize_with_deepseek(
-                    paper_info,
-                    prompt_template=prompt_template,
-                    api_key=args.deepseek_api_key,
-                    api_url=args.deepseek_api_url,
-                    model=args.deepseek_model,
-                    max_tokens=args.deepseek_max_tokens,
-                    session=session,
-                )
-                # 打印 LLM 返回的原始内容（用于调试）
-                print("\n=== LLM 返回内容 ===")
-                print(analysis)
-                print("===================\n")
-                score = _extract_score(analysis)
+                paper = future.result()
+                paper_data.append(paper)
             except Exception as e:
-                print(f"LLM 调用失败: {str(e)}")
-                analysis = f"【LLM 解析失败】{str(e)}\n\n【摘要】{paper_info['summary']}"
-                score = 3.0
-
-        paper_data.append({
-            "title": paper_info["title"],
-            "url": paper_info["url"],
-            "code_url": code_url,
-            "analysis": analysis,
-            "score": score,
-        })
+                index = future_to_index[future]
+                print(f"处理论文 {index} 时发生错误: {str(e)}")
+                # 继续处理其他论文
 
     # 第二步：按评分从高到低排序
     paper_data.sort(key=lambda x: x["score"], reverse=True)
