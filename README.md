@@ -30,13 +30,14 @@ pip install -r requirements.txt
 
 ### 2. 配置
 
-**需要配置 3-4 个敏感信息**（其他配置已写死在代码中）：
+**需要配置 4 个敏感信息**（本地最少可省略 `OPENALEX_API_KEY`，但 GitHub Actions 中建议视为必配）：
 
 ```bash
 export FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/你的Webhook地址"
 export DEEPSEEK_API_KEY="你的智谱API Key"
 export OPENALEX_EMAIL="your-email@example.com"  # 用于 OpenAlex Polite Pool，提高请求优先级
-export OPENALEX_API_KEY="your-api-key"  # 可选，用于访问高级功能（如 from_created_date 过滤）
+export OPENALEX_API_KEY="your-api-key"  # 推荐配置；GitHub Actions 默认必配，作为 api_key 查询参数发送
+# export OPENALEX_PREMIUM="1"  # 仅 Premium 账号需要；启用 from_created_date / created_date 排序
 ```
 
 你也可以把上述变量写到项目根目录的 `.env` 文件，脚本会自动加载。
@@ -44,7 +45,8 @@ export OPENALEX_API_KEY="your-api-key"  # 可选，用于访问高级功能（�
 - 飞书 Webhook：在飞书群设置 → 添加机器人 → 自定义机器人 → 获取 Webhook 地址
 - 智谱 GLM API Key：在 [智谱开放平台](https://open.bigmodel.cn/) 获取
 - OpenAlex Email：填写你的邮箱地址（任何有效邮箱即可），用于加入 OpenAlex Polite Pool，获得更高的请求优先级和速率限制
-- OpenAlex API Key（可选）：在 [OpenAlex 设置页面](https://openalex.org/settings/api) 免费获取，用于访问高级功能如 `from_created_date` 过滤器，可以更准确地获取最新论文
+- OpenAlex API Key（推荐，本地可选，GitHub Actions 必配）：在 [OpenAlex 设置页面](https://openalex.org/settings/api) 获取。脚本会把它作为 `api_key` 查询参数发送，用于稳定免费额度；免费 key 不会解锁 `from_created_date`
+- OpenAlex Premium（可选）：只有你购买了 Premium 方案时，才需要额外设置 `OPENALEX_PREMIUM=1` 来启用 `from_created_date`
 
 **默认配置**（已写死在代码中，无需修改）：
 - 模型：`glm-4-7`（使用 Coding API 端点）
@@ -70,7 +72,8 @@ python3 daily_paper.py
 - `--prompt-file prompts/deepseek_summary_prompt.zh.j2`：自定义 Prompt 模板（Jinja2，默认已提供）
 - `--per-paper` 或 `FEISHU_PER_PAPER=1`：每篇论文单独发一张卡片
 - `--dry-run`：只打印，不推送飞书（调试用）
-- `--skip-llm`：不调用 DeepSeek，仅输出摘要（用于无 Key 的本地测试）
+- `--skip-llm`：不调用 DeepSeek，仅输出摘要（用于本地测试）
+- `--openalex-premium` 或 `OPENALEX_PREMIUM=1`：仅 Premium 账号使用，启用 `from_created_date`
 
 ### 4. 设置每日自动运行（GitHub Actions，推荐）
 
@@ -89,11 +92,14 @@ python3 daily_paper.py
 
    进入仓库页面 → Settings → Secrets and variables → Actions → New repository secret
 
-   **需要添加 3-4 个 Secrets**：
+   **需要添加 4 个 Secrets**：
    - `FEISHU_WEBHOOK`：你的飞书 Webhook 地址
    - `DEEPSEEK_API_KEY`：你的智谱 GLM API Key
    - `OPENALEX_EMAIL`：你的邮箱地址（用于 OpenAlex Polite Pool）
-   - `OPENALEX_API_KEY`：你的 OpenAlex API Key（可选，推荐添加以获得更准确的日期过滤）
+   - `OPENALEX_API_KEY`：你的 OpenAlex API Key（必配；免费 key 即可）
+
+   如果你有 OpenAlex Premium，再到 `Settings → Secrets and variables → Actions → Variables` 添加：
+   - `OPENALEX_PREMIUM=1`
 
    其他配置（模型、查询关键词、推送数量等）已写死在代码中，无需配置。
 
@@ -122,6 +128,7 @@ python3 daily_paper.py
 
 - 确保网络可访问 OpenAlex API、DeepSeek API 和飞书服务器
 - OpenAlex API 相比 ArXiv 官方 API 更稳定，特别适合 GitHub Actions 环境
+- 免费 OpenAlex key 使用 `from_publication_date`；只有 Premium 模式才会启用 `from_created_date`
 - 建议先手动运行测试，确认配置无误后再设置定时任务
 - 如需修改论文查询关键词，可用 `--query` 或设置 `ARXIV_QUERY`
 
@@ -136,5 +143,5 @@ python3 daily_paper.py
 
 如果你之前使用的是 ArXiv API，只需：
 1. 更新代码到最新版本
-2. 添加 `OPENALEX_EMAIL` 环境变量
+2. 添加 `OPENALEX_EMAIL` 和 `OPENALEX_API_KEY` 环境变量
 3. 移除 `arxiv` Python 包依赖（已在 requirements.txt 中移除）

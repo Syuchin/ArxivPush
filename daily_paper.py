@@ -73,12 +73,17 @@ REQUEST_INTERVAL = 1.5
 # OpenAlex API 配置
 OPENALEX_PER_PAGE = 50  # 每次请求的结果数量
 OPENALEX_TIMEOUT = 30  # 请求超时时间（秒）
+OPENALEX_PLAN_UPGRADE_MARKER = "Plan upgrade required"
 
 # 预编译正则：匹配【相关性】X/5 格式的评分
 _SCORE_RE = re.compile(r'【相关性】\s*(\d+(?:\.\d+)?)\s*/\s*5')
 
 # 预编译正则：匹配【标签名】内容 格式的分析段落
 _SECTION_RE = re.compile(r'【([^】]+)】\s*(.*?)(?=【|$)', re.DOTALL)
+
+
+class OpenAlexPlanUpgradeRequiredError(RuntimeError):
+    """Raised when a premium-only OpenAlex filter is used without premium access."""
 
 
 def _strtobool(v: Optional[str]) -> bool:
@@ -466,6 +471,188 @@ def push_to_feishu(
             raise RuntimeError(f"飞书返回错误: {json.dumps(data, ensure_ascii=False)}")
 
 
+def _build_openalex_params(
+    *,
+    query: str,
+    max_results: int,
+    since_hours: float,
+    email: str,
+    api_key: Optional[str],
+    use_premium: bool,
+) -> dict[str, Any]:
+    date_filter_type = "from_created_date" if use_premium else "from_publication_date"
+    sort_field = "created_date" if use_premium else "publication_date"
+
+    params: dict[str, Any] = {
+        "filter": f"indexed_in:arxiv,title.search:{query}",
+        "sort": f"{sort_field}:desc",
+        "mailto": email,
+        "per_page": min(OPENALEX_PER_PAGE, max_results),
+    }
+    if api_key:
+        params["api_key"] = api_key
+
+    if since_hours > 0:
+        threshold = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        from_date = threshold.strftime("%Y-%m-%d")
+        params["filter"] += f",{date_filter_type}:{from_date}"
+        if use_premium:
+            print(f"过滤条件：只获取 {from_date} 之后添加到 OpenAlex 的论文（Premium 模式）")
+        else:
+            print(f"过滤条件：只获取 {from_date} 之后发布的论文（免费兼容模式）")
+
+    return params
+
+
+def _extract_openalex_error_message(response: Optional[requests.Response]) -> str:
+    if response is None:
+        return ""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text
+    if isinstance(payload, dict):
+        parts = []
+        for key in ("error", "message"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                parts.append(value)
+        if parts:
+            return " | ".join(parts)
+    return response.text
+
+
+def _fetch_papers_from_openalex_once(
+    query: str,
+    max_results: int,
+    since_hours: float,
+    email: str,
+    session: requests.Session,
+    api_key: Optional[str],
+    use_premium: bool,
+) -> list[dict]:
+    params = _build_openalex_params(
+        query=query,
+        max_results=max_results,
+        since_hours=since_hours,
+        email=email,
+        api_key=api_key,
+        use_premium=use_premium,
+    )
+
+    papers = []
+    page = 1
+
+    while len(papers) < max_results:
+        try:
+            params["page"] = page
+
+            response = session.get(
+                OPENALEX_BASE_URL,
+                params=params,
+                timeout=OPENALEX_TIMEOUT,
+            )
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                error_message = _extract_openalex_error_message(response)
+                if (
+                    use_premium
+                    and response.status_code == 429
+                    and OPENALEX_PLAN_UPGRADE_MARKER in error_message
+                ):
+                    raise OpenAlexPlanUpgradeRequiredError(error_message) from e
+                raise
+
+            data = response.json()
+            results = data.get("results", [])
+            if not results:
+                break
+
+            for work in results:
+                if len(papers) >= max_results:
+                    break
+
+                arxiv_id = None
+                arxiv_url = None
+
+                ids = work.get("ids", {})
+                if "arxiv" in ids:
+                    arxiv_url = ids["arxiv"]
+                    if arxiv_url:
+                        match = re.search(r"arxiv\.org/abs/(\S+)", arxiv_url)
+                        if match:
+                            arxiv_id = match.group(1)
+
+                if not arxiv_url:
+                    locations = work.get("locations", [])
+                    for loc in locations:
+                        landing_page = loc.get("landing_page_url", "")
+                        if "arxiv.org" in landing_page:
+                            arxiv_url = landing_page
+                            match = re.search(r"arxiv\.org/abs/(\S+)", landing_page)
+                            if match:
+                                arxiv_id = match.group(1)
+                            break
+
+                if not arxiv_url:
+                    continue
+
+                abstract = work.get("abstract", "")
+                if not abstract:
+                    inv_index = work.get("abstract_inverted_index", {})
+                    if inv_index:
+                        words = []
+                        for word, positions in inv_index.items():
+                            for pos in positions:
+                                words.append((pos, word))
+                        words.sort()
+                        abstract = " ".join([w[1] for w in words])
+
+                pub_date_str = work.get("publication_date")
+                published = None
+                if pub_date_str:
+                    try:
+                        published = datetime.strptime(pub_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        pass
+
+                openalex_id = work.get("id", "")
+
+                class PaperResult:
+                    def __init__(self, title, summary, entry_id, published, openalex_id):
+                        self.title = title
+                        self.summary = summary
+                        self.entry_id = entry_id
+                        self.published = published
+                        self.openalex_id = openalex_id
+
+                paper = PaperResult(
+                    title=work.get("display_name", "").strip(),
+                    summary=abstract.strip() if abstract else "",
+                    entry_id=arxiv_url,
+                    published=published,
+                    openalex_id=openalex_id,
+                )
+                papers.append(paper)
+
+            meta = data.get("meta", {})
+            if page * params["per_page"] >= meta.get("count", 0):
+                break
+
+            page += 1
+            time.sleep(REQUEST_INTERVAL)
+
+        except OpenAlexPlanUpgradeRequiredError:
+            raise
+        except requests.exceptions.RequestException as e:
+            print(f"OpenAlex API 请求失败: {str(e)}", file=sys.stderr)
+            break
+        except Exception as e:
+            print(f"解析 OpenAlex 响应时出错: {str(e)}", file=sys.stderr)
+            break
+
+    return papers
 
 
 def fetch_papers_from_openalex(
@@ -475,6 +662,7 @@ def fetch_papers_from_openalex(
     email: str,
     session: requests.Session,
     api_key: Optional[str] = None,
+    use_premium: bool = False,
 ) -> list[dict]:
     """
     从 OpenAlex API 获取 ArXiv 论文
@@ -485,157 +673,53 @@ def fetch_papers_from_openalex(
         since_hours: 只获取最近 N 小时内的论文（0 表示不限制）
         email: 用于 Polite Pool 的邮箱地址
         session: requests.Session 对象
-        api_key: OpenAlex API Key（可选，用于访问高级功能如 from_created_date）
+        api_key: OpenAlex API Key（可选，作为 api_key 查询参数发送）
+        use_premium: 是否启用 Premium 时间过滤（from_created_date）
 
     Returns:
         论文列表，每个论文是一个字典，包含 title, summary, entry_id, published 等字段
     """
     print(f"正在从 OpenAlex API 查询论文（关键词：{query}）...")
 
-    # 构建查询参数
-    # 如果有 API Key，使用 from_created_date（更准确）
-    # 否则使用 from_publication_date
-    use_created_date = api_key is not None
-    date_filter_type = 'from_created_date' if use_created_date else 'from_publication_date'
-    sort_field = 'created_date' if use_created_date else 'publication_date'
-
-    params = {
-        'filter': f'indexed_in:arxiv,title.search:{query}',
-        'sort': f'{sort_field}:desc',
-        'mailto': email,
-        'per_page': min(OPENALEX_PER_PAGE, max_results),
-    }
-
-    # 如果指定了时间范围，添加日期过滤
-    if since_hours > 0:
-        now = datetime.now(timezone.utc)
-        threshold = now - timedelta(hours=since_hours)
-        # OpenAlex 使用 YYYY-MM-DD 格式
-        from_date = threshold.strftime('%Y-%m-%d')
-        params['filter'] += f',{date_filter_type}:{from_date}'
-        if use_created_date:
-            print(f"过滤条件：只获取 {from_date} 之后添加到 OpenAlex 的论文（使用 API Key）")
-        else:
-            print(f"过滤条件：只获取 {from_date} 之后发布的论文")
-
-    papers = []
-    page = 1
-
-    while len(papers) < max_results:
+    attempt_premium = bool(api_key) and use_premium
+    if attempt_premium:
+        print("OpenAlex Premium 模式已启用：优先尝试 created_date 过滤。")
         try:
-            params['page'] = page
-
-            # 如果有 API Key，添加到请求头
-            headers = {}
-            if api_key:
-                headers['Authorization'] = f'Bearer {api_key}'
-
-            response = session.get(
-                OPENALEX_BASE_URL,
-                params=params,
-                headers=headers,
-                timeout=OPENALEX_TIMEOUT
+            papers = _fetch_papers_from_openalex_once(
+                query=query,
+                max_results=max_results,
+                since_hours=since_hours,
+                email=email,
+                session=session,
+                api_key=api_key,
+                use_premium=True,
             )
-            response.raise_for_status()
-            data = response.json()
-
-            results = data.get('results', [])
-            if not results:
-                break
-
-            for work in results:
-                if len(papers) >= max_results:
-                    break
-
-                # 提取 ArXiv ID 和 URL
-                arxiv_id = None
-                arxiv_url = None
-
-                # 从 ids 字段中提取 ArXiv ID
-                ids = work.get('ids', {})
-                if 'arxiv' in ids:
-                    arxiv_url = ids['arxiv']
-                    # 从 URL 中提取 ID
-                    if arxiv_url:
-                        match = re.search(r'arxiv\.org/abs/(\S+)', arxiv_url)
-                        if match:
-                            arxiv_id = match.group(1)
-
-                # 如果没有找到 ArXiv URL，尝试从 locations 中查找
-                if not arxiv_url:
-                    locations = work.get('locations', [])
-                    for loc in locations:
-                        landing_page = loc.get('landing_page_url', '')
-                        if 'arxiv.org' in landing_page:
-                            arxiv_url = landing_page
-                            match = re.search(r'arxiv\.org/abs/(\S+)', landing_page)
-                            if match:
-                                arxiv_id = match.group(1)
-                            break
-
-                # 如果还是没有找到，跳过这篇论文
-                if not arxiv_url:
-                    continue
-
-                # 提取摘要
-                abstract = work.get('abstract', '')
-                if not abstract:
-                    # 如果没有摘要，尝试使用 abstract_inverted_index
-                    inv_index = work.get('abstract_inverted_index', {})
-                    if inv_index:
-                        # 重建摘要文本
-                        words = []
-                        for word, positions in inv_index.items():
-                            for pos in positions:
-                                words.append((pos, word))
-                        words.sort()
-                        abstract = ' '.join([w[1] for w in words])
-
-                # 提取发布日期
-                pub_date_str = work.get('publication_date')
-                published = None
-                if pub_date_str:
-                    try:
-                        published = datetime.strptime(pub_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        pass
-
-                # 提取 OpenAlex ID（用于去重）
-                openalex_id = work.get('id', '')
-
-                # 构建与 ArXiv API 兼容的论文对象（使用简单的字典模拟 arxiv.Result）
-                class PaperResult:
-                    def __init__(self, title, summary, entry_id, published, openalex_id):
-                        self.title = title
-                        self.summary = summary
-                        self.entry_id = entry_id
-                        self.published = published
-                        self.openalex_id = openalex_id  # 用于去重
-
-                paper = PaperResult(
-                    title=work.get('display_name', '').strip(),
-                    summary=abstract.strip() if abstract else '',
-                    entry_id=arxiv_url,
-                    published=published,
-                    openalex_id=openalex_id,
-                )
-
-                papers.append(paper)
-
-            # 检查是否还有更多结果
-            meta = data.get('meta', {})
-            if page * params['per_page'] >= meta.get('count', 0):
-                break
-
-            page += 1
-            time.sleep(REQUEST_INTERVAL)  # 避免请求过快
-
-        except requests.exceptions.RequestException as e:
-            print(f"OpenAlex API 请求失败: {str(e)}", file=sys.stderr)
-            break
-        except Exception as e:
-            print(f"解析 OpenAlex 响应时出错: {str(e)}", file=sys.stderr)
-            break
+        except OpenAlexPlanUpgradeRequiredError as e:
+            print(
+                f"OpenAlex Premium 过滤不可用，自动降级到免费兼容模式：{e}",
+                file=sys.stderr,
+            )
+            papers = _fetch_papers_from_openalex_once(
+                query=query,
+                max_results=max_results,
+                since_hours=since_hours,
+                email=email,
+                session=session,
+                api_key=api_key,
+                use_premium=False,
+            )
+    else:
+        if use_premium and not api_key:
+            print("已请求 OpenAlex Premium 模式，但未提供 OPENALEX_API_KEY，改为免费兼容模式。", file=sys.stderr)
+        papers = _fetch_papers_from_openalex_once(
+            query=query,
+            max_results=max_results,
+            since_hours=since_hours,
+            email=email,
+            session=session,
+            api_key=api_key,
+            use_premium=False,
+        )
 
     print(f"从 OpenAlex 获取到 {len(papers)} 篇论文")
     return papers
@@ -697,7 +781,8 @@ def _parse_args() -> argparse.Namespace:
 
     # OpenAlex API 配置
     parser.add_argument("--openalex-email", default=_getenv_str("OPENALEX_EMAIL"), help="Email for OpenAlex Polite Pool")
-    parser.add_argument("--openalex-api-key", default=_getenv_str("OPENALEX_API_KEY"), help="OpenAlex API Key (optional, for advanced features)")
+    parser.add_argument("--openalex-api-key", default=_getenv_str("OPENALEX_API_KEY"), help="OpenAlex API Key (recommended; sent as api_key query parameter)")
+    parser.add_argument("--openalex-premium", action="store_true", default=_strtobool(os.getenv("OPENALEX_PREMIUM")), help="Enable Premium-only OpenAlex filters such as from_created_date")
 
     parser.add_argument("--feishu-webhook", default=_getenv_str("FEISHU_WEBHOOK"))
     parser.add_argument("--per-paper", action="store_true", default=_strtobool(os.getenv("FEISHU_PER_PAPER")))
@@ -731,6 +816,12 @@ def main() -> int:
     if not args.openalex_email:
         print("缺少 OPENALEX_EMAIL：请在环境变量或参数中设置 --openalex-email。", file=sys.stderr)
         return 2
+    if args.openalex_premium and not args.openalex_api_key:
+        print("启用 OpenAlex Premium 模式时必须提供 OPENALEX_API_KEY。", file=sys.stderr)
+        return 2
+    if os.getenv("GITHUB_ACTIONS") == "true" and not args.openalex_api_key:
+        print("在 GitHub Actions 中缺少 OPENALEX_API_KEY：请将其配置到 repository secrets。", file=sys.stderr)
+        return 2
 
     prompt_template = None
     if not args.skip_llm:
@@ -750,6 +841,7 @@ def main() -> int:
         email=args.openalex_email,
         session=session,
         api_key=args.openalex_api_key,
+        use_premium=args.openalex_premium,
     )
 
     if not results:
